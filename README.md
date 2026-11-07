@@ -6,6 +6,18 @@ Software X is a FastAPI backend for finding products in local shops. Buyers can 
 
 Supabase is the only external service. Search parsing and location/county matching run locally. Shop coordinates can be entered manually; distance ranking is used only when both the buyer and shop have coordinates. The app does not call Google Maps or an LLM provider.
 
+## Optional local Phi-4 model
+
+The optional [`Phi-4-mini-instruct` Q4_K_M GGUF](https://huggingface.co/unsloth/Phi-4-mini-instruct-GGUF) is stored at `app/llm/Phi-4-mini-instruct-Q4_K_M.gguf` (about 2.49 GB). The model is ignored by Git because of its size. It is not currently used by the API; search parsing remains offline and rule-based.
+
+Install the CPU inference runtime in the active virtual environment:
+
+```bash
+pip install -r requirements-llm.txt
+```
+
+If pip needs to build `llama-cpp-python` from source, install CMake and a C++17 compiler first (on Fedora: `sudo dnf install cmake gcc-c++`). The model can be loaded with `llama_cpp.Llama` using the path above. Allow several additional gigabytes of RAM for inference, depending on context length.
+
 ## Set up locally
 
 1. Create a Python environment and install the app:
