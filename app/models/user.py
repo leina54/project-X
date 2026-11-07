@@ -9,7 +9,6 @@ Role = Literal["buyer", "shop"]
 class User(BaseModel):
     id: str
     email: EmailStr
-    hashed_password: str
     role: Role
     created_at: datetime | None = None
 

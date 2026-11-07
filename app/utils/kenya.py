@@ -1,0 +1,57 @@
+KENYAN_COUNTIES = {
+    "baringo": "Baringo",
+    "bomet": "Bomet",
+    "bungoma": "Bungoma",
+    "busia": "Busia",
+    "elgeyo marakwet": "Elgeyo-Marakwet",
+    "embu": "Embu",
+    "garissa": "Garissa",
+    "homa bay": "Homa Bay",
+    "isiolo": "Isiolo",
+    "kajiado": "Kajiado",
+    "kakamega": "Kakamega",
+    "kericho": "Kericho",
+    "kiambu": "Kiambu",
+    "kilifi": "Kilifi",
+    "kirinyaga": "Kirinyaga",
+    "kisii": "Kisii",
+    "kisumu": "Kisumu",
+    "kitui": "Kitui",
+    "kwale": "Kwale",
+    "laikipia": "Laikipia",
+    "lamu": "Lamu",
+    "machakos": "Machakos",
+    "makueni": "Makueni",
+    "mandera": "Mandera",
+    "marsabit": "Marsabit",
+    "meru": "Meru",
+    "migori": "Migori",
+    "mombasa": "Mombasa",
+    "murang'a": "Murang'a",
+    "nakuru": "Nakuru",
+    "nandi": "Nandi",
+    "narok": "Narok",
+    "nyamira": "Nyamira",
+    "nyandarua": "Nyandarua",
+    "nyeri": "Nyeri",
+    "samburu": "Samburu",
+    "siaya": "Siaya",
+    "taita taveta": "Taita-Taveta",
+    "tana river": "Tana River",
+    "tharaka nithi": "Tharaka-Nithi",
+    "trans nzoia": "Trans Nzoia",
+    "turkana": "Turkana",
+    "uasin gishu": "Uasin Gishu",
+    "vihiga": "Vihiga",
+    "wajir": "Wajir",
+    "west pokot": "West Pokot",
+    "nairobi": "Nairobi",
+}
+
+
+def canonical_county(value: str) -> str:
+    key = " ".join(value.lower().replace("-", " ").replace(" county", "").split())
+    try:
+        return KENYAN_COUNTIES[key]
+    except KeyError as exc:
+        raise ValueError("County must be one of Kenya's 47 counties") from exc

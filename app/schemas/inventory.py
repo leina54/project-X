@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class InventoryCreate(BaseModel):
@@ -38,6 +38,12 @@ class InventoryUpdate(BaseModel):
             raise ValueError("Product name must be 20 words or fewer")
         return value
 
+    @model_validator(mode="after")
+    def require_changes(self) -> "InventoryUpdate":
+        if not any(getattr(self, field) is not None for field in self.model_fields_set):
+            raise ValueError("At least one inventory field must be provided")
+        return self
+
 
 class InventoryOut(BaseModel):
     id: str
@@ -46,4 +52,5 @@ class InventoryOut(BaseModel):
     normalized_name: str
     price_kes: Decimal
     quantity: int
+    is_active: bool = True
     last_updated_at: datetime | None = None

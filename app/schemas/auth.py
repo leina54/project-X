@@ -16,7 +16,7 @@ class RegisterRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(min_length=1, max_length=72)
 
     @field_validator("email", mode="before")
     @classmethod
@@ -25,6 +25,12 @@ class LoginRequest(BaseModel):
 
 
 class TokenResponse(BaseModel):
-    access_token: str
+    access_token: str | None = None
+    refresh_token: str | None = None
     token_type: str = "bearer"
+    requires_email_confirmation: bool = False
     user: UserPublic
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(min_length=1)

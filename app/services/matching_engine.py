@@ -1,3 +1,5 @@
+import math
+import heapq
 from decimal import Decimal
 
 from app.schemas.matching import (
@@ -7,8 +9,8 @@ from app.schemas.matching import (
     SearchRequest,
     SearchResponse,
 )
-from app.services import inventory_service, llm_service, maps_service
-from app.utils.helpers import parse_iso_datetime, tokenize, utcnow
+from app.services import inventory_service, query_parser
+from app.utils.helpers import normalize_name, parse_iso_datetime, tokenize, utcnow
 
 WEIGHTS = {
     "relevance": 0.40,
@@ -19,21 +21,26 @@ WEIGHTS = {
 
 
 def search(payload: SearchRequest) -> SearchResponse:
-    constraints = llm_service.parse_query(payload.query)
-    origin = _origin(payload, constraints)
-    candidates = inventory_service.list_live_inventory()
-
-    matches: list[MatchResult] = []
-    product_tokens = tokenize(constraints.product)
-    for row in candidates:
-        shop = inventory_service.maybe_geocode_shop(row["shop"])
+    constraints = query_parser.parse_query(payload.query)
+    if payload.location:
+        constraints.location = payload.location.strip()
+    if payload.county:
+        constraints.county = payload.county.strip()
+    origin = _origin(payload)
+    candidates = inventory_service.iter_live_inventory(
+        county=constraints.county,
+        max_price_kes=constraints.max_price_kes,
+    )
+    ranked_matches: list[tuple[float, int, MatchResult]] = []
+    product_tokens = _search_tokens(constraints.product)
+    for candidate_index, row in enumerate(candidates):
+        shop = row["shop"]
         item = row["item"]
-        if not _passes_filters(item, constraints, product_tokens):
+        if not _passes_filters(item, shop, constraints, product_tokens):
             continue
-        distance = maps_service.distance_km(origin, shop.get("lat"), shop.get("lng"))
+        distance = _distance_km(origin, shop.get("lat"), shop.get("lng"))
         breakdown = _score(item, constraints, product_tokens, distance)
-        matches.append(
-            MatchResult(
+        match = MatchResult(
                 shop_id=shop["id"],
                 shop_name=shop["name"],
                 location=shop.get("location"),
@@ -47,34 +54,84 @@ def search(payload: SearchRequest) -> SearchResponse:
                 last_updated_at=parse_iso_datetime(item.get("last_updated_at")),
                 score=breakdown,
             )
-        )
-
-    matches.sort(key=lambda match: match.score.total, reverse=True)
+        ranked_entry = (match.score.total, -candidate_index, match)
+        if len(ranked_matches) < payload.limit:
+            heapq.heappush(ranked_matches, ranked_entry)
+        elif ranked_entry[:2] > ranked_matches[0][:2]:
+            heapq.heapreplace(ranked_matches, ranked_entry)
+    ranked_matches.sort(key=lambda entry: entry[:2], reverse=True)
     return SearchResponse(
         query=payload.query,
         constraints=constraints,
-        matches=matches[: payload.limit],
+        matches=[entry[2] for entry in ranked_matches],
     )
 
 
-def _origin(payload: SearchRequest, constraints: ParsedConstraints) -> tuple[float, float] | None:
+def _origin(payload: SearchRequest) -> tuple[float, float] | None:
     if payload.user_lat is not None and payload.user_lng is not None:
         return payload.user_lat, payload.user_lng
-    if constraints.location:
-        return maps_service.geocode(constraints.location)
     return None
 
 
-def _passes_filters(item: dict, constraints: ParsedConstraints, product_tokens: set[str]) -> bool:
-    name_tokens = tokenize(item.get("normalized_name") or item.get("name") or "")
+def _passes_filters(
+    item: dict,
+    shop: dict,
+    constraints: ParsedConstraints,
+    product_tokens: set[str],
+) -> bool:
+    name_tokens = _search_tokens(item.get("normalized_name") or item.get("name") or "")
     if product_tokens and name_tokens.isdisjoint(product_tokens):
-        # Keep items that contain the full product string as a substring.
         haystack = item.get("normalized_name") or ""
         if constraints.product not in haystack:
             return False
-    if constraints.max_price_kes is not None and float(item["price_kes"]) > constraints.max_price_kes * 1.25:
+    if constraints.max_price_kes is not None and float(item["price_kes"]) > constraints.max_price_kes:
+        return False
+    if constraints.county and _normalize(shop.get("county")) != _normalize(constraints.county):
+        return False
+    if constraints.location:
+        location_tokens = _search_tokens(constraints.location)
+        shop_location_tokens = _search_tokens(
+            " ".join(
+                str(shop.get(field) or "")
+                for field in ("location", "neighborhood", "address")
+            )
+        )
+        if not location_tokens.issubset(shop_location_tokens):
+            return False
+    if not item.get("is_active", True) or int(item.get("quantity") or 0) <= 0:
         return False
     return True
+
+
+def _normalize(value: object) -> str:
+    return normalize_name(str(value or ""))
+
+
+def _search_tokens(value: object) -> set[str]:
+    tokens = tokenize(str(value or ""))
+    normalized = set()
+    for token in tokens:
+        if len(token) > 4 and token.endswith("ies"):
+            token = f"{token[:-3]}y"
+        elif len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        normalized.add(token)
+    return normalized
+
+
+def _distance_km(
+    origin: tuple[float, float] | None,
+    dest_lat: float | None,
+    dest_lng: float | None,
+) -> float | None:
+    if origin is None or dest_lat is None or dest_lng is None:
+        return None
+    radius = 6371.0
+    phi1, phi2 = math.radians(origin[0]), math.radians(dest_lat)
+    d_phi = math.radians(dest_lat - origin[0])
+    d_lambda = math.radians(dest_lng - origin[1])
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return round(2 * radius * math.asin(math.sqrt(a)), 3)
 
 
 def _score(
@@ -103,13 +160,10 @@ def _score(
 
 
 def _relevance(item: dict, product_tokens: set[str]) -> float:
-    name_tokens = tokenize(item.get("normalized_name") or item.get("name") or "")
+    name_tokens = _search_tokens(item.get("normalized_name") or item.get("name") or "")
     if not product_tokens or not name_tokens:
         return 0.0
-    overlap = len(product_tokens & name_tokens) / len(product_tokens)
-    if (item.get("normalized_name") or "").startswith(" ".join(sorted(product_tokens)[:1])):
-        overlap = min(1.0, overlap + 0.1)
-    return overlap
+    return len(product_tokens & name_tokens) / len(product_tokens)
 
 
 def _price_fit(price: float, constraints: ParsedConstraints) -> float:
