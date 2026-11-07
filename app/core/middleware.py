@@ -24,6 +24,8 @@ class RequestGuardMiddleware:
             "/auth/login": auth_limit,
             "/auth/token": auth_limit,
             "/matching/search": search_limit,
+            "/inquiries/searches": search_limit,
+            "/inquiries/products": auth_limit,
         }
         self.requests: dict[tuple[str, str], deque[float]] = defaultdict(deque)
         self.lock = asyncio.Lock()

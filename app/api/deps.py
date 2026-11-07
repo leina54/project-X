@@ -47,3 +47,12 @@ def require_shop_user(user: User = Depends(get_current_user)) -> User:
             detail="Shop account required",
         )
     return user
+
+
+def require_buyer_user(user: User = Depends(get_current_user)) -> User:
+    if user.role != "buyer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Buyer account required",
+        )
+    return user

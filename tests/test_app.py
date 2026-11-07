@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from postgrest.exceptions import APIError
 from pydantic import ValidationError
-from supabase_auth.errors import AuthApiError
+from supabase_auth.errors import AuthApiError, AuthRetryableError
 
 from app.api.deps import get_current_user
 from app.core.config import Settings
@@ -16,9 +16,10 @@ from app.core.middleware import RequestGuardMiddleware
 from app.main import app, settings
 from app.models.user import User
 from app.schemas.inventory import InventoryCreate, InventoryUpdate
+from app.schemas.inquiries import ProductInquiryCreate, ProductInquiryUpdate
 from app.schemas.matching import SearchRequest
 from app.schemas.shop import ShopCreate
-from app.services import auth_service, inventory_service, matching_engine, query_parser
+from app.services import auth_service, inquiry_service, inventory_service, matching_engine, query_parser
 
 
 @pytest.fixture
@@ -217,6 +218,24 @@ def test_register_login_and_duplicate_email(client, monkeypatch):
     assert duplicate.status_code == 409
 
 
+def test_auth_retryable_error_returns_retryable_service_unavailable(client, monkeypatch):
+    class RetryableAuth:
+        def sign_up(self, _):
+            raise AuthRetryableError("network timeout", 500)
+
+    class RetryableClient:
+        auth = RetryableAuth()
+
+    monkeypatch.setattr(auth_service, "get_supabase", lambda: RetryableClient())
+    response = client.post(
+        "/auth/register",
+        json={"email": "shop@example.com", "password": "secure-pass-1", "role": "shop"},
+    )
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "10"
+    assert "temporarily unavailable" in response.json()["detail"]
+
+
 def test_signup_without_email_confirmation_returns_no_session(client, monkeypatch):
     class ConfirmationAuth(FakeAuth):
         def sign_up(self, credentials):
@@ -280,6 +299,99 @@ def test_shop_schema_requires_valid_kenyan_county():
     assert shop.county == "Taita-Taveta"
     with pytest.raises(ValidationError):
         ShopCreate(name="Shop", location="Main Street", county="Unknown")
+
+
+def test_product_inquiry_validation():
+    inquiry = ProductInquiryCreate(
+        shop_id="shop-1",
+        item_id="item-1",
+        message="  Is this available today?  ",
+    )
+    assert inquiry.message == "Is this available today?"
+    assert ProductInquiryUpdate(shop_reply="  Yes, it is in stock.  ").shop_reply == (
+        "Yes, it is in stock."
+    )
+    with pytest.raises(ValidationError):
+        ProductInquiryCreate(shop_id="shop-1", item_id="item-1", message="  ")
+    with pytest.raises(ValidationError):
+        ProductInquiryUpdate()
+
+
+def test_saved_search_endpoint_requires_buyer(client):
+    app.dependency_overrides[get_current_user] = lambda: _user("shop")
+    response = client.post("/inquiries/searches", json={"query": "moringa soap"})
+    assert response.status_code == 403
+
+
+def test_buyer_can_save_search_and_receive_matches(client, monkeypatch):
+    app.dependency_overrides[get_current_user] = lambda: _user("buyer")
+    result = matching_engine.search(SearchRequest(query="moringa soap"))
+    saved = {
+        "id": "search-1",
+        "created_at": datetime.now(timezone.utc),
+        "result": result,
+    }
+    seen = {}
+
+    def create_saved_search(user, payload):
+        seen.update(user_id=user.id, query=payload.query)
+        return saved
+
+    monkeypatch.setattr(inquiry_service, "create_saved_search", create_saved_search)
+    response = client.post("/inquiries/searches", json={"query": "moringa soap"})
+    assert response.status_code == 201
+    assert response.json()["id"] == "search-1"
+    assert response.json()["result"]["query"] == "moringa soap"
+    assert seen == {"user_id": "user-1", "query": "moringa soap"}
+
+
+def test_missing_inquiry_migration_returns_actionable_error(client, monkeypatch):
+    app.dependency_overrides[get_current_user] = lambda: _user("buyer")
+
+    def fail(*_args, **_kwargs):
+        raise APIError({"code": "PGRST205", "message": "Table not found"})
+
+    monkeypatch.setattr(inquiry_service, "list_saved_searches", fail)
+    response = client.get("/inquiries/searches")
+    assert response.status_code == 503
+    assert "sql/004_inquiries.sql" in response.json()["detail"]
+
+
+def test_shop_can_update_direct_product_inquiry(client, monkeypatch):
+    app.dependency_overrides[get_current_user] = lambda: _user("shop")
+    seen = {}
+    updated = {
+        "id": "inquiry-1",
+        "buyer_id": "buyer-1",
+        "shop_id": "shop-1",
+        "item_id": "item-1",
+        "message": "Is this available?",
+        "shop_reply": "Yes, it is.",
+        "status": "responded",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    def update_product_inquiry(user, inquiry_id, payload):
+        seen.update(
+            user_id=user.id,
+            inquiry_id=inquiry_id,
+            shop_reply=payload.shop_reply,
+        )
+        return updated
+
+    monkeypatch.setattr(inquiry_service, "update_product_inquiry", update_product_inquiry)
+    response = client.patch(
+        "/inquiries/products/inquiry-1",
+        json={"shop_reply": "Yes, it is."},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "responded"
+    assert seen == {
+        "user_id": "user-1",
+        "inquiry_id": "inquiry-1",
+        "shop_reply": "Yes, it is.",
+    }
 
 
 def test_search_parser_extracts_product_price_location_and_county():
@@ -420,7 +532,7 @@ def test_readiness_requires_auth_migration(client, monkeypatch):
     response = client.get("/ready")
     assert response.status_code == 503
     assert response.json()["dependency"] == "supabase_schema"
-    assert "sql/003_supabase_auth_rls.sql" in response.json()["next_step"]
+    assert "sql/004_inquiries.sql" in response.json()["next_step"]
 
 
 def test_readiness_identifies_missing_rpc_migration(client, monkeypatch):
@@ -442,8 +554,8 @@ def test_readiness_identifies_missing_rpc_migration(client, monkeypatch):
         "status": "not_ready",
         "dependency": "supabase_schema",
         "next_step": (
-            "Apply sql/003_supabase_auth_rls.sql in the Supabase SQL Editor "
-            "after sql/001_init.sql and sql/002_validate_production_data.sql."
+            "Apply sql/004_inquiries.sql after confirming migrations "
+            "001 through 003 completed successfully."
         ),
     }
 

@@ -8,9 +8,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from postgrest.exceptions import APIError
-from supabase_auth.errors import AuthApiError
+from supabase_auth.errors import AuthApiError, AuthRetryableError
 
-from app.api import auth, inventory, matching, payments, shops
+from app.api import auth, inquiries, inventory, matching, payments, shops
 from app.core.config import get_settings
 from app.core.middleware import RequestGuardMiddleware
 from app.db.supabase import (
@@ -114,6 +114,20 @@ async def handle_upstream_connection_error(
 async def handle_supabase_error(request: Request, exc: APIError) -> JSONResponse:
     code = getattr(exc, "code", None)
     logger.error("Supabase request failed for %s %s (code=%s)", request.method, request.url.path, code)
+    if request.url.path.startswith("/inquiries") and code in {
+        "PGRST202",
+        "PGRST204",
+        "PGRST205",
+    }:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    "Inquiry tables are not installed yet. Run sql/004_inquiries.sql "
+                    "after migrations 001 through 003."
+                )
+            },
+        )
     if code == "23505":
         status_code, detail = 409, "A record with these unique values already exists"
     elif code in {"23503", "23514", "22P02"}:
@@ -138,6 +152,29 @@ async def handle_supabase_auth_error(request: Request, exc: AuthApiError) -> JSO
     )
 
 
+@app.exception_handler(AuthRetryableError)
+async def handle_supabase_auth_retryable_error(
+    request: Request,
+    exc: AuthRetryableError,
+) -> JSONResponse:
+    logger.warning(
+        "Supabase Auth temporarily unavailable for %s %s (%s)",
+        request.method,
+        request.url.path,
+        type(exc).__name__,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": (
+                "Supabase Auth is temporarily unavailable. Check your connection "
+                "and retry the request."
+            )
+        },
+        headers={"Retry-After": "10"},
+    )
+
+
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
     return RedirectResponse(url="/docs")
@@ -146,6 +183,7 @@ def root() -> RedirectResponse:
 app.include_router(auth.router)
 app.include_router(shops.router)
 app.include_router(inventory.router)
+app.include_router(inquiries.router)
 app.include_router(matching.router)
 app.include_router(payments.router)
 
@@ -158,7 +196,7 @@ def health() -> dict:
 @app.get("/ready", tags=["system"])
 def readiness() -> JSONResponse:
     try:
-        result = get_supabase().rpc("backend_readiness").execute()
+        result = get_supabase().rpc("backend_inquiries_readiness").execute()
         if result.data is not True:
             return JSONResponse(
                 status_code=503,
@@ -166,8 +204,8 @@ def readiness() -> JSONResponse:
                     "status": "not_ready",
                     "dependency": "supabase_schema",
                     "next_step": (
-                        "Confirm sql/001_init.sql, sql/002_validate_production_data.sql, "
-                        "and sql/003_supabase_auth_rls.sql completed successfully."
+                        "Apply sql/004_inquiries.sql after confirming migrations "
+                        "001 through 003 completed successfully."
                     ),
                 },
             )
@@ -180,8 +218,8 @@ def readiness() -> JSONResponse:
                     "status": "not_ready",
                     "dependency": "supabase_schema",
                     "next_step": (
-                        "Apply sql/003_supabase_auth_rls.sql in the Supabase SQL Editor "
-                        "after sql/001_init.sql and sql/002_validate_production_data.sql."
+                        "Apply sql/004_inquiries.sql after confirming migrations "
+                        "001 through 003 completed successfully."
                     ),
                 },
             )
